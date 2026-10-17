@@ -1,0 +1,39 @@
+{
+  "name": "pi",
+  "displayName": "Pi",
+  "description": "Pi Agent 插件：把本机安装的 Pi coding agent 以 RPC 模式接入 Coda，支持会话指令、模型与推理强度选择、插话和会话恢复。",
+  "version": "0.1.0",
+  "contributes": {
+    "agents": [
+      {
+        "id": "pi",
+        "displayName": "Pi",
+        "icon": {
+          "light": "icons/pi.pdf",
+          "template": true
+        },
+        "command": "exec \"$CODA_NODE\" \"$CODA_PLUGIN_PATH/agent/entry.mjs\"",
+        "skillsDir": ".agents/skills",
+        "configFiles": [
+          "${PI_CODING_AGENT_DIR:-~/.pi/agent}/settings.json",
+          "${PI_CODING_AGENT_DIR:-~/.pi/agent}/models.json"
+        ],
+        "setupHint": "安装 `npm i -g @earendil-works/pi-coding-agent` 并在 pi 里配置 provider/登录"
+      }
+    ],
+    "configuration": {
+      "properties": {
+        "pi.commandPath": {
+          "type": "string",
+          "default": "pi",
+          "description": "pi 可执行文件的路径；留为 pi 时使用 PATH 和常见安装目录。"
+        },
+        "pi.extraArgs": {
+          "type": "string",
+          "default": "",
+          "description": "追加到 pi --mode rpc 的额外参数，按空白分隔。"
+        }
+      }
+    }
+  }
+}
