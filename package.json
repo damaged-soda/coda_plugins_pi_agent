@@ -9,8 +9,7 @@
         "id": "pi",
         "displayName": "Pi",
         "icon": {
-          "light": "icons/pi.pdf",
-          "template": true
+          "light": "icons/pi.pdf"
         },
         "command": "exec \"$CODA_NODE\" \"$CODA_PLUGIN_PATH/agent/entry.mjs\"",
         "skillsDir": ".agents/skills",
