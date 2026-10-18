@@ -1,11 +1,12 @@
 // Pi Agent entry: speaks ACP to Coda on stdio, spawns `pi --mode rpc` as a child.
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import fs, { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join, dirname, isAbsolute, resolve, sep } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { readLines } from './lines.mjs';
 import { PiRpc } from './pi-rpc.mjs';
+import { classifyPiFailure, isPiAuthError, getBase64DecodedSize } from './errors.mjs';
 
 const log = (...args) => process.stderr.write(`[pi-agent] ${args.join(' ')}\n`);
 
@@ -26,17 +27,23 @@ const codaNode = process.env.CODA_NODE || process.execPath;
 // ---- State ----
 let initParams = null;
 const sessions = new Map(); // sessionId -> SessionState
+const loadingSessions = new Set();
 
 class SessionState {
   constructor(sessionId, cwd) {
     this.sessionId = sessionId;
     this.cwd = cwd;
     this.pi = null;
+    this.systemPromptFile = null;
+    this.extraArgs = [];
+    this.ensuring = null;
     this.turn = null; // { resolve, reject, updates, text, cancelled, steered }
     this.models = [];
     this.thinkingLevels = [];
     this.currentModelValue = null;
     this.currentThinkingLevel = null;
+    this.chosenModelValue = null;
+    this.chosenThinkingLevel = null;
     this.commands = [];
     this.configOptions = [];
     this.elicitationSupported = false;
@@ -45,7 +52,7 @@ class SessionState {
 
 function getPiCommand() {
   const configured = settings['pi.commandPath'];
-  if (configured) return configured;
+  if (configured && configured !== 'pi') return configured;
   try {
     const found = execSync('which pi', { encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
     if (found) return found;
@@ -80,9 +87,10 @@ function parseModelValue(value) {
 function buildConfigOptions(session) {
   const opts = [];
   // Model select
-  if (session.models.length > 0) {
+  if (session.models.length > 0 && session.currentModelValue) {
     opts.push({
       id: 'model',
+      name: '模型',
       type: 'select',
       category: 'model',
       currentValue: session.currentModelValue,
@@ -96,6 +104,7 @@ function buildConfigOptions(session) {
   if (session.thinkingLevels.length > 1 || (session.thinkingLevels.length === 1 && session.thinkingLevels[0] !== 'off')) {
     opts.push({
       id: 'thinking',
+      name: '推理强度',
       type: 'select',
       category: 'thought_level',
       currentValue: session.currentThinkingLevel ?? 'medium',
@@ -128,6 +137,105 @@ function notifyAvailableCommands(session) {
   });
 }
 
+function assertContained(targetPath, baseDir) {
+  const resolvedTarget = resolve(targetPath);
+  const resolvedBase = resolve(baseDir);
+  if (resolvedTarget !== resolvedBase && !resolvedTarget.startsWith(resolvedBase + sep)) {
+    throw Object.assign(new Error(`Path traversal detected: ${targetPath} is outside ${baseDir}`), { code: -32602 });
+  }
+  return resolvedTarget;
+}
+
+async function ensurePiRunning(session) {
+  while (session.ensuring) {
+    await session.ensuring;
+  }
+  if (session.pi && !session.pi.exited && session.pi.ready) return;
+  session.ensuring = (async () => {
+    try {
+      await spawnPi(session, session.systemPromptFile, session.extraArgs);
+      session.pi.ready = false;
+
+      if (session.chosenModelValue && session.currentModelValue !== session.chosenModelValue) {
+        let reapplyFailed = false;
+        let failError = null;
+        try {
+          const { provider, modelId } = parseModelValue(session.chosenModelValue);
+          const res = await session.pi.send('set_model', { provider, modelId }, { timeout: 15000 });
+          if (!res) throw new Error('set_model returned falsy');
+          session.currentModelValue = session.chosenModelValue;
+          try {
+            const levels = await session.pi.send('get_available_thinking_levels', {}, { timeout: 10000 });
+            session.thinkingLevels = levels?.levels ?? [];
+            const state = await session.pi.send('get_state', {}, { timeout: 10000 });
+            session.currentThinkingLevel = state.thinkingLevel ?? null;
+          } catch {}
+        } catch (e) {
+          reapplyFailed = true;
+          failError = e;
+          log('Failed to re-apply chosen model after respawn:', e.message);
+        }
+        if (reapplyFailed) {
+          try {
+            const refreshed = await session.pi.send('get_state', {}, { timeout: 10000 });
+            session.currentModelValue = refreshed?.model ? modelValue(refreshed.model) : null;
+            session.currentThinkingLevel = refreshed?.thinkingLevel ?? null;
+          } catch {}
+          session.chosenModelValue = session.currentModelValue;
+          if (session.pi) session.pi.ready = true;
+          const configOptions = buildConfigOptions(session);
+          notify('session/update', {
+            sessionId: session.sessionId,
+            update: { sessionUpdate: 'config_option_update', configOptions },
+          });
+          throw Object.assign(
+            new Error(`Pi 重启后无法恢复之前选择的模型（${session.chosenModelValue}）：${failError?.message || '未知错误'}`),
+            { code: -32603 }
+          );
+        }
+      }
+
+      if (session.chosenThinkingLevel && session.currentThinkingLevel !== session.chosenThinkingLevel) {
+        let reapplyFailed = false;
+        let failError = null;
+        try {
+          const res = await session.pi.send('set_thinking_level', { level: session.chosenThinkingLevel }, { timeout: 10000 });
+          if (!res) throw new Error('set_thinking_level returned falsy');
+          session.currentThinkingLevel = session.chosenThinkingLevel;
+        } catch (e) {
+          reapplyFailed = true;
+          failError = e;
+          log('Failed to re-apply chosen thinking level after respawn:', e.message);
+        }
+        if (reapplyFailed) {
+          try {
+            const refreshed = await session.pi.send('get_state', {}, { timeout: 10000 });
+            session.currentThinkingLevel = refreshed?.thinkingLevel ?? null;
+          } catch {}
+          session.chosenThinkingLevel = session.currentThinkingLevel;
+          if (session.pi) session.pi.ready = true;
+          const configOptions = buildConfigOptions(session);
+          notify('session/update', {
+            sessionId: session.sessionId,
+            update: { sessionUpdate: 'config_option_update', configOptions },
+          });
+          throw Object.assign(
+            new Error(`Pi 重启后无法恢复之前选择的推理强度（${session.chosenThinkingLevel}）：${failError?.message || '未知错误'}`),
+            { code: -32603 }
+          );
+        }
+      }
+
+      session.pi.ready = true;
+      buildConfigOptions(session);
+    } finally {
+      session.ensuring = null;
+    }
+  })();
+
+  await session.ensuring;
+}
+
 // ---- Spawn pi for a session ----
 async function spawnPi(session, systemPromptFile, extraArgs = []) {
   const args = ['--mode', 'rpc', '--session-id', session.sessionId, ...extraArgs];
@@ -146,9 +254,17 @@ async function spawnPi(session, systemPromptFile, extraArgs = []) {
   // in `pi --resume`.
   const env = { ...process.env };
   const nodeDir = dirname(codaNode);
-  if (!env.PATH?.includes(nodeDir)) {
-    env.PATH = `${nodeDir}:${env.PATH || ''}`;
+  let pathVal = env.PATH || '';
+  if (isAbsolute(piCommand)) {
+    const piDir = dirname(piCommand);
+    if (!pathVal.split(':').includes(piDir)) {
+      pathVal = `${piDir}:${pathVal}`;
+    }
   }
+  if (!pathVal.split(':').includes(nodeDir)) {
+    pathVal = `${nodeDir}:${pathVal}`;
+  }
+  env.PATH = pathVal;
 
   const pi = new PiRpc({
     piCommand,
@@ -157,11 +273,12 @@ async function spawnPi(session, systemPromptFile, extraArgs = []) {
     env,
     onEvent: record => handlePiEvent(session, record),
     onExtensionUI: record => handleExtensionUI(session, record),
-    onExit: (code, signal) => handlePiExit(session, code, signal),
+    onExit: (code, signal) => handlePiExit(session, pi, code, signal),
   });
   pi.spawn();
   session.pi = pi;
 
+  try {
   // Query initial state
   try {
     const state = await pi.send('get_state', {}, { timeout: 15000 });
@@ -187,6 +304,35 @@ async function spawnPi(session, systemPromptFile, extraArgs = []) {
     throw Object.assign(new Error('Pi 没有可用的模型。请先配置 Pi 的 provider 和登录信息。'), { code: -32000 });
   }
 
+  if (!session.currentModelValue) {
+    let fallbackSucceeded = false;
+    for (const m of session.models) {
+      try {
+        const res = await pi.send('set_model', { provider: m.provider, modelId: m.id }, { timeout: 15000 });
+        if (res) {
+          fallbackSucceeded = true;
+          break;
+        }
+      } catch (e) {
+        log(`set_model fallback failed for ${m.provider}/${m.id}:`, e.message);
+      }
+    }
+    if (!fallbackSucceeded) {
+      throw Object.assign(new Error('Pi 没有可用的默认模型，尝试切换全部可用模型均失败。'), { code: -32603 });
+    }
+    try {
+      const refreshedState = await pi.send('get_state', {}, { timeout: 15000 });
+      if (refreshedState?.model) {
+        session.currentModelValue = modelValue(refreshedState.model);
+      }
+      session.currentThinkingLevel = refreshedState?.thinkingLevel ?? null;
+    } catch (e) {
+      log('get_state refresh failed:', e.message);
+    }
+    if (!session.currentModelValue) {
+      throw Object.assign(new Error('Pi 没有可用的默认模型。'), { code: -32603 });
+    }
+  }
 
   try {
     const levels = await pi.send('get_available_thinking_levels', {}, { timeout: 10000 });
@@ -204,10 +350,41 @@ async function spawnPi(session, systemPromptFile, extraArgs = []) {
 
   buildConfigOptions(session);
   notifyAvailableCommands(session);
+  pi.ready = true;
+  } catch (err) {
+    try {
+      pi.close();
+      pi.kill('SIGTERM');
+      const killTimer = setTimeout(() => {
+        try { pi.kill('SIGKILL'); } catch {}
+      }, 500);
+      killTimer.unref?.();
+    } catch {}
+    session.pi = null;
+    throw err;
+  }
 }
 
 // ---- Handle pi events ----
 function handlePiEvent(session, record) {
+  // Session-level events (occur whether or not a turn is active)
+  if (record.type === 'session_info_changed') {
+    notify('session/update', {
+      sessionId: session.sessionId,
+      update: { sessionUpdate: 'session_info_update', title: record.name || null },
+    });
+    return;
+  }
+  if (record.type === 'thinking_level_changed') {
+    session.currentThinkingLevel = record.level;
+    const configOptions = buildConfigOptions(session);
+    notify('session/update', {
+      sessionId: session.sessionId,
+      update: { sessionUpdate: 'config_option_update', configOptions },
+    });
+    return;
+  }
+
   const turn = session.turn;
   if (!turn) return;
 
@@ -256,15 +433,14 @@ function handlePiEvent(session, record) {
       break;
     }
     case 'tool_execution_update': {
-      const content = record.partialResult?.content;
-      const text = content?.map(c => c.text ?? '').join('') ?? '';
-      if (text) {
+      const blocks = mapToolResultContent(record.partialResult?.content);
+      if (blocks.length) {
         notify('session/update', {
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId: record.toolCallId,
-            content: [{ type: 'content', content: { type: 'text', text } }],
+            content: blocks,
             status: 'in_progress',
           },
         });
@@ -272,17 +448,23 @@ function handlePiEvent(session, record) {
       break;
     }
     case 'tool_execution_end': {
-      const content = record.result?.content;
-      const text = content?.map(c => c.text ?? '').join('') ?? '';
+      const blocks = mapToolResultContent(record.result?.content);
       notify('session/update', {
         sessionId: session.sessionId,
         update: {
           sessionUpdate: 'tool_call_update',
           toolCallId: record.toolCallId,
-          content: text ? [{ type: 'content', content: { type: 'text', text } }] : [],
+          content: blocks,
           status: record.isError ? 'failed' : 'completed',
+          rawOutput: record.result,
         },
       });
+      break;
+    }
+    case 'auto_retry_end': {
+      if (record.success === false && record.finalError) {
+        turn.finalRetryError = record.finalError;
+      }
       break;
     }
     case 'agent_settled': {
@@ -290,12 +472,17 @@ function handlePiEvent(session, record) {
         turn.stopReason = 'cancelled';
       }
       turn.settled = true;
-      finishTurn(session);
+      turn.settledAborted = Boolean(record.aborted);
+      finishTurn(session, turn);
       break;
     }
     case 'agent_end': {
       // Store info from agent_end but don't finish yet (wait for agent_settled)
+      turn.lastWillRetry = Boolean(record.willRetry);
       if (record.willRetry) break;
+      turn.lastStopReason = null;
+      turn.errorMessage = null;
+      turn.finalRetryError = null;
       const messages = record.messages ?? [];
       const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant');
       if (lastAssistant) {
@@ -303,16 +490,10 @@ function handlePiEvent(session, record) {
         else if (lastAssistant.stopReason === 'error' || lastAssistant.stopReason === 'aborted') {
           turn.lastStopReason = lastAssistant.stopReason;
           turn.errorMessage = lastAssistant.errorMessage;
+        } else {
+          turn.lastStopReason = lastAssistant.stopReason ?? null;
+          turn.errorMessage = null;
         }
-      }
-      break;
-    }
-    case 'session_info_changed': {
-      if (record.name !== undefined) {
-        notify('session/update', {
-          sessionId: session.sessionId,
-          update: { sessionUpdate: 'session_info_update', ...(record.name ? { title: record.name } : {}) },
-        });
       }
       break;
     }
@@ -321,18 +502,31 @@ function handlePiEvent(session, record) {
   }
 }
 
-function finishTurn(session) {
-  const turn = session.turn;
+function finishTurn(session, targetTurn) {
+  const turn = targetTurn || session.turn;
   if (!turn || !turn.settled) return;
+  if (session.turn !== turn) return;
   session.turn = null;
+  clearPendingExtUI(session);
 
   let stopReason = turn.stopReason || 'end_turn';
   if (turn.cancelled) stopReason = 'cancelled';
   else if (turn.lastStopReason === 'max_tokens') stopReason = 'max_tokens';
 
   // Check for error
-  if (turn.lastStopReason === 'error' && !turn.cancelled && turn.errorMessage) {
-    turn.reject?.({ code: -32603, message: turn.errorMessage });
+  if (turn.lastStopReason === 'error' && !turn.cancelled) {
+    const errorText = turn.finalRetryError || turn.errorMessage || 'Pi 返回了错误，但没有附带错误信息';
+    const canTag = ['started', 'queued'].includes(turn.disposition) &&
+      !turn.settledAborted &&
+      !turn.cancelled &&
+      turn.lastWillRetry === false;
+    const failure = canTag ? classifyPiFailure(errorText) : null;
+    const err = {
+      code: -32603,
+      message: errorText,
+      ...(failure ? { data: { _meta: { coda: { failure } } } } : {}),
+    };
+    turn.reject?.(err);
     return;
   }
 
@@ -368,6 +562,43 @@ function toolLocations(toolName, args) {
   return locs;
 }
 
+function mapToolResultContent(contentArray) {
+  if (!Array.isArray(contentArray)) return [];
+  const blocks = [];
+  for (const block of contentArray) {
+    if (!block) continue;
+    if (block.type === 'image' && block.data) {
+      blocks.push({
+        type: 'content',
+        content: {
+          type: 'image',
+          data: block.data,
+          mimeType: block.mimeType || 'image/png',
+        },
+      });
+    } else if (block.type === 'text' || typeof block.text === 'string') {
+      const text = block.text ?? '';
+      if (text) {
+        blocks.push({
+          type: 'content',
+          content: { type: 'text', text },
+        });
+      }
+    }
+  }
+  return blocks;
+}
+
+function clearPendingExtUI(session) {
+  if (!session._pendingExtUI || session._pendingExtUI.size === 0) return;
+  for (const [reqId, pending] of session._pendingExtUI) {
+    if (pending.timer) clearTimeout(pending.timer);
+    notify('$/cancel_request', { requestId: reqId });
+    session.pi?.write({ type: 'extension_ui_response', id: pending.piId, cancelled: true });
+  }
+  session._pendingExtUI.clear();
+}
+
 // ---- Handle extension UI requests from pi ----
 function handleExtensionUI(session, record) {
   const turn = session.turn;
@@ -375,13 +606,6 @@ function handleExtensionUI(session, record) {
 
   // Fire-and-forget methods: just log or map
   if (['notify', 'setStatus', 'setWidget', 'set_editor_text'].includes(method)) {
-    // setTitle -> session_info_update
-    if (method === 'setTitle' && record.title) {
-      notify('session/update', {
-        sessionId: session.sessionId,
-        update: { sessionUpdate: 'session_info_update', title: record.title },
-      });
-    }
     return;
   }
   if (method === 'setTitle') {
@@ -395,7 +619,7 @@ function handleExtensionUI(session, record) {
   }
 
   // Dialog methods: only forward while a turn is in progress
-  if (!turn) {
+  if (!turn || turn.cancelled) {
     // Outside a turn, cancel immediately
     session.pi.write({ type: 'extension_ui_response', id: record.id, cancelled: true });
     return;
@@ -436,8 +660,17 @@ function handleConfirm(session, record) {
       ],
     },
   });
+  let timer = null;
+  if (typeof record.timeout === 'number' && record.timeout > 0) {
+    timer = setTimeout(() => {
+      if (session._pendingExtUI?.has(reqId)) {
+        session._pendingExtUI.delete(reqId);
+        notify('$/cancel_request', { requestId: reqId });
+      }
+    }, record.timeout);
+  }
   session._pendingExtUI = session._pendingExtUI || new Map();
-  session._pendingExtUI.set(reqId, { piId: record.id, type: 'confirm' });
+  session._pendingExtUI.set(reqId, { piId: record.id, type: 'confirm', timer });
 }
 
 // select -> ACP elicitation/create
@@ -486,30 +719,52 @@ function requestElicitation(session, record, type, schema) {
   send({
     id: reqId,
     method: 'elicitation/create',
-    params: { sessionId: session.sessionId, message: record.title ?? '', requestedSchema: schema },
+    params: {
+      sessionId: session.sessionId,
+      mode: 'form',
+      message: record.title ?? '',
+      requestedSchema: schema,
+    },
   });
+  let timer = null;
+  if (typeof record.timeout === 'number' && record.timeout > 0) {
+    timer = setTimeout(() => {
+      if (session._pendingExtUI?.has(reqId)) {
+        session._pendingExtUI.delete(reqId);
+        notify('$/cancel_request', { requestId: reqId });
+      }
+    }, record.timeout);
+  }
   session._pendingExtUI = session._pendingExtUI || new Map();
-  session._pendingExtUI.set(reqId, { piId: record.id, type });
+  session._pendingExtUI.set(reqId, { piId: record.id, type, timer });
 }
 
 // ---- Handle pi exit ----
-function handlePiExit(session, code, signal) {
+function handlePiExit(session, pi, code, signal) {
   log(`Pi exited: ${signal ?? `code ${code}`}`);
+  if (session.pi !== pi) return;
+  session.pi = null;
+  clearPendingExtUI(session);
   if (session.turn) {
     const turn = session.turn;
     session.turn = null;
-    turn.reject?.({
-      code: -32603,
-      message: `Pi 进程意外退出（${signal ?? `code ${code}`}）${session.pi.stderrTail ? `\n${session.pi.stderrTail.trim().split('\n').slice(-3).join('\n')}` : ''}`,
-    });
+    if (turn.cancelled) {
+      turn.resolve?.({ stopReason: 'cancelled' });
+    } else {
+      turn.reject?.({
+        code: -32603,
+        message: `Pi 进程意外退出（${signal ?? `code ${code}`}）${pi?.stderrTail ? `\n${pi.stderrTail.trim().split('\n').slice(-3).join('\n')}` : ''}`,
+      });
+    }
   }
 }
 
 // ---- System prompt file ----
 function writeSystemPrompt(sessionId, text) {
   const dir = join(pluginState, 'prompts');
-  try { mkdirSync(dir, { recursive: true }); } catch {}
   const file = join(dir, `${sessionId}.md`);
+  assertContained(file, dir);
+  try { mkdirSync(dir, { recursive: true }); } catch {}
   writeFileSync(file, text, 'utf8');
   return file;
 }
@@ -535,7 +790,7 @@ const methods = {
         sessionCapabilities: { systemPrompt: {} },
       },
       _meta: { steering: { supported: true } },
-      agentInfo: { name: 'Pi', version: '0.1.0' },
+      agentInfo: { name: 'Pi', version: '0.1.1' },
     };
   },
 
@@ -548,66 +803,87 @@ const methods = {
     const text = validateSystemPrompt(sp);
 
     const sessionId = randomUUID();
-    const cwd = params.cwd || process.cwd();
-    const session = new SessionState(sessionId, cwd);
-
-    // Check elicitation support
-    session.elicitationSupported = !!initParams?.clientCapabilities?.elicitation?.form;
-
-    // Write system prompt
-    let promptFile = null;
-    if (text) {
-      promptFile = writeSystemPrompt(sessionId, text);
-    }
-
+    loadingSessions.add(sessionId);
     try {
-      await spawnPi(session, promptFile);
-    } catch (e) {
-      throw Object.assign(new Error(e.message), { code: e.code ?? -32603 });
+      const cwd = params.cwd || process.cwd();
+      const session = new SessionState(sessionId, cwd);
+
+      // Check elicitation support
+      session.elicitationSupported = !!initParams?.clientCapabilities?.elicitation?.form;
+
+      // Write system prompt
+      let promptFile = null;
+      if (text) {
+        promptFile = writeSystemPrompt(sessionId, text);
+      }
+
+      session.systemPromptFile = promptFile;
+      session.extraArgs = [];
+
+      try {
+        await spawnPi(session, promptFile);
+      } catch (e) {
+        throw Object.assign(new Error(e.message), { code: e.code ?? -32603 });
+      }
+
+      sessions.set(sessionId, session);
+
+      return { sessionId, configOptions: session.configOptions };
+    } finally {
+      loadingSessions.delete(sessionId);
     }
-
-    sessions.set(sessionId, session);
-
-    return { sessionId, configOptions: session.configOptions };
   },
 
   'session/load': async (params) => {
     const { sessionId } = params;
-    if (!sessionId) throw Object.assign(new Error('sessionId is required'), { code: -32602 });
-
-    const sp = params.systemPrompt;
-    if (sp && sp.mode !== 'append') {
-      throw Object.assign(new Error(`不支持 systemPrompt 模式 ${sp.mode}`), { code: -32602 });
-    }
-    const text = validateSystemPrompt(sp);
-
-    const cwd = params.cwd || process.cwd();
-    const session = new SessionState(sessionId, cwd);
-    session.elicitationSupported = !!initParams?.clientCapabilities?.elicitation?.form;
-
-    let promptFile = null;
-    if (text) {
-      promptFile = writeSystemPrompt(sessionId, text);
+    if (!sessionId || typeof sessionId !== 'string') throw Object.assign(new Error('sessionId is required'), { code: -32602 });
+    if (sessionId.length > 128 || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(sessionId)) {
+      throw Object.assign(new Error('无效的 sessionId'), { code: -32602 });
     }
 
+    loadingSessions.add(sessionId);
     try {
-      await spawnPi(session, promptFile);
-    } catch (e) {
-      throw Object.assign(new Error(e.message), { code: e.code ?? -32603 });
+      const sp = params.systemPrompt;
+      if (sp && sp.mode !== 'append') {
+        throw Object.assign(new Error(`不支持 systemPrompt 模式 ${sp.mode}`), { code: -32602 });
+      }
+      const text = validateSystemPrompt(sp);
+
+      const cwd = params.cwd || process.cwd();
+      const session = new SessionState(sessionId, cwd);
+      session.elicitationSupported = !!initParams?.clientCapabilities?.elicitation?.form;
+
+      let promptFile = null;
+      if (text) {
+        promptFile = writeSystemPrompt(sessionId, text);
+      }
+
+      session.systemPromptFile = promptFile;
+      session.extraArgs = [];
+
+      try {
+        await spawnPi(session, promptFile);
+      } catch (e) {
+        throw Object.assign(new Error(e.message), { code: e.code ?? -32603 });
+      }
+
+      sessions.set(sessionId, session);
+
+      return { configOptions: session.configOptions };
+    } finally {
+      loadingSessions.delete(sessionId);
     }
-
-    sessions.set(sessionId, session);
-
-    return { sessionId, configOptions: session.configOptions };
   },
 
   'session/set_config_option': async (params) => {
     const session = getSession(params.sessionId);
+    await ensurePiRunning(session);
     const { configId, value } = params;
 
     if (configId === 'model') {
       const { provider, modelId } = parseModelValue(value);
       await session.pi.send('set_model', { provider, modelId }, { timeout: 15000 });
+      session.chosenModelValue = value;
       session.currentModelValue = value;
       // Refresh thinking levels (they depend on model)
       try {
@@ -619,6 +895,7 @@ const methods = {
       } catch {}
     } else if (configId === 'thinking') {
       await session.pi.send('set_thinking_level', { level: value }, { timeout: 10000 });
+      session.chosenThinkingLevel = value;
       session.currentThinkingLevel = value;
     } else {
       throw Object.assign(new Error(`Unknown configId: ${configId}`), { code: -32602 });
@@ -632,70 +909,95 @@ const methods = {
     return methods['session/set_config_option']({ ...params, configId: 'model', value: params.modelId });
   },
 
-  'session/prompt': async (params) => {
+  'session/prompt': (params) => {
     const session = getSession(params.sessionId);
     if (session.turn) {
       throw Object.assign(new Error('已有一轮正在进行'), { code: -32603 });
     }
 
-    // Map ACP prompt content to pi prompt
-    const blocks = params.prompt ?? [];
-    let messageText = '';
-    const images = [];
-    for (const block of blocks) {
-      if (block.type === 'text') {
-        messageText += (messageText ? '\n' : '') + block.text;
-      } else if (block.type === 'image') {
-        images.push({ type: 'image', data: block.data, mimeType: block.mimeType ?? 'image/png' });
-      } else if (block.type === 'resource_link') {
-        const ref = block.uri ?? block.path ?? '';
-        if (ref) messageText += (messageText ? '\n' : '') + ref;
-      } else if (block.type === 'resource') {
-        const resText = block.resource?.text ?? '';
-        if (resText) {
-          messageText += (messageText ? '\n' : '') + `--- ${block.resource?.uri ?? 'resource'} ---\n${resText}\n---`;
-        }
-      }
-    }
-
-    // Create turn promise
     return new Promise((resolve, reject) => {
-      session.turn = {
-        resolve,
+      let settled = false;
+      const turn = {
+        preparing: true,
+        resolve: (val) => {
+          if (settled) return;
+          settled = true;
+          if (session.turn === turn) session.turn = null;
+          clearPendingExtUI(session);
+          resolve(val);
+        },
         reject: (err) => {
-          session.turn = null;
-          if (err.code) reject(Object.assign(new Error(err.message), { code: err.code, data: err.data }));
-          else reject(err);
+          if (settled) return;
+          settled = true;
+          if (session.turn === turn) session.turn = null;
+          clearPendingExtUI(session);
+          if (turn.cancelled) {
+            resolve({ stopReason: 'cancelled' });
+            return;
+          }
+          const errObj = err instanceof Error ? err : Object.assign(new Error(err?.message || String(err)), { code: err?.code });
+          if (err?.code !== undefined && errObj.code === undefined) errObj.code = err.code;
+          if (err?.data !== undefined) errObj.data = err.data;
+          reject(errObj);
         },
         text: '',
         cancelled: false,
         settled: false,
+        settledAborted: false,
+        disposition: null,
         stopReason: null,
         lastStopReason: null,
         errorMessage: null,
+        lastWillRetry: null,
+        finalRetryError: null,
         steered: null,
       };
+      session.turn = turn;
 
-      const piPrompt = { message: messageText };
-      if (images.length) piPrompt.images = images;
+      (async () => {
+        try {
+          await ensurePiRunning(session);
+          if (session.turn !== turn || turn.cancelled || turn.settled) return;
 
-      session.pi.send('prompt', piPrompt, { timeout: 300000 })
-        .then(data => {
-          // prompt accepted; now wait for agent_settled via events
-          if (data?.disposition === 'handled') {
-            // Extension command consumed it, finish immediately
-            session.turn.settled = true;
-            session.turn.stopReason = 'end_turn';
-            finishTurn(session);
+          const { message: messageText, images } = await mapAcpPrompt(params.prompt, session.sessionId);
+          if (session.turn !== turn || turn.cancelled || turn.settled) return;
+
+          turn.preparing = false;
+          const pi = session.pi;
+          const piPrompt = { message: messageText };
+          if (images.length) piPrompt.images = images;
+
+          pi.send('prompt', piPrompt, { timeout: 300000 })
+            .then(data => {
+              if (session.turn === turn && session.pi === pi) {
+                turn.disposition = data?.disposition;
+                if (data?.disposition === 'handled') {
+                  turn.settled = true;
+                  turn.stopReason = 'end_turn';
+                  finishTurn(session, turn);
+                }
+              }
+            })
+            .catch(err => {
+              if (session.turn === turn && session.pi === pi) {
+                if (turn.cancelled) {
+                  turn.resolve({ stopReason: 'cancelled' });
+                  return;
+                }
+                const isAuth = isPiAuthError(err.message);
+                turn.reject({ code: isAuth ? -32000 : -32603, message: err.message });
+              }
+            });
+        } catch (err) {
+          if (session.turn === turn && !turn.settled) {
+            if (turn.cancelled) {
+              turn.resolve({ stopReason: 'cancelled' });
+            } else {
+              turn.reject(err);
+            }
           }
-        })
-        .catch(err => {
-          if (session.turn) {
-            const turn = session.turn;
-            session.turn = null;
-            turn.reject?.({ code: -32603, message: err.message });
-          }
-        });
+        }
+      })();
     });
   },
 
@@ -703,21 +1005,166 @@ const methods = {
     const session = sessions.get(params.sessionId);
     if (!session) return { outcome: 'promptRequired', reason: 'noRunningTurn' };
 
-    if (!session.turn || session.turn.cancelled) {
+    const turn = session.turn;
+    const pi = session.pi;
+    if (!turn || turn.preparing || turn.cancelled || turn.settled || !pi || pi.exited || !pi.ready || session.ensuring) {
       return { outcome: 'promptRequired', reason: 'noRunningTurn' };
     }
 
     // Send steer to pi
-    const text = (params.prompt ?? []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    let message, images;
     try {
-      await session.pi.send('steer', { message: text }, { timeout: 30000 });
-      return { outcome: 'injected' };
+      const mapped = await mapAcpPrompt(params.prompt, session.sessionId);
+      message = mapped.message;
+      images = mapped.images;
+    } catch (e) {
+      log('steer mapAcpPrompt failed:', e.message);
+      return { outcome: 'failed' };
+    }
+    const steerCmd = { message };
+    if (images.length) steerCmd.images = images;
+    try {
+      await pi.send('steer', steerCmd, { timeout: 30000 });
+      if (session.turn === turn && !turn.settled && !turn.cancelled && session.pi === pi) {
+        return { outcome: 'injected' };
+      }
+      return { outcome: 'failed' };
     } catch (e) {
       log('steer failed:', e.message);
-      return { outcome: 'injected' }; // Still report injected since pi queued it
+      const turnEnded = session.turn !== turn || turn.settled || turn.cancelled;
+      if (turnEnded && e.piError === true) {
+        return { outcome: 'promptRequired', reason: 'noRunningTurn' };
+      }
+      return { outcome: 'failed' };
     }
   },
 };
+
+const MAX_BLOB_SIZE = 50 * 1024 * 1024; // 50 MiB
+
+function getSanitizedBasename(uri, mimeType) {
+  let name = '';
+  if (uri) {
+    try {
+      const u = new URL(uri);
+      name = u.pathname.split('/').filter(Boolean).pop() || '';
+    } catch {
+      name = uri.split(/[/\\?#]/).filter(Boolean).pop() || '';
+    }
+  }
+  name = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+  if (!name || name === '.' || name === '..') {
+    name = 'attachment';
+  }
+  if (!name.includes('.')) {
+    const ext = mimeType?.split('/')[1]?.split(';')[0]?.replace(/[^a-zA-Z0-9]/g, '');
+    if (ext) name += `.${ext}`;
+  }
+  if (name.length > 80) {
+    name = name.slice(0, 80);
+  }
+  return name;
+}
+
+async function mapAcpPrompt(blocks, sessionId) {
+  let message = '';
+  const images = [];
+  let attachmentIndex = 0;
+  for (const block of (blocks ?? [])) {
+    if (block.type === 'text') {
+      message += (message ? '\n' : '') + block.text;
+    } else if (block.type === 'image') {
+      if (block.data) {
+        if (getBase64DecodedSize(block.data) > MAX_BLOB_SIZE) {
+          throw Object.assign(new Error('附件大小超过 50 MiB 限制'), { code: -32602 });
+        }
+        images.push({ type: 'image', data: block.data, mimeType: block.mimeType ?? 'image/png' });
+      }
+    } else if (block.type === 'resource_link') {
+      const ref = block.uri ?? block.path ?? '';
+      if (ref) message += (message ? '\n' : '') + ref;
+    } else if (block.type === 'resource') {
+      const res = block.resource;
+      if (res?.text) {
+        message += (message ? '\n' : '') + `--- ${res.uri ?? 'resource'} ---\n${res.text}\n---`;
+      } else if (res?.blob) {
+        if (getBase64DecodedSize(res.blob) > MAX_BLOB_SIZE) {
+          throw Object.assign(new Error('附件大小超过 50 MiB 限制'), { code: -32602 });
+        }
+        const mime = res.mimeType ?? '';
+        const buf = Buffer.from(res.blob, 'base64');
+        if (buf.length > MAX_BLOB_SIZE) {
+          throw Object.assign(new Error('附件大小超过 50 MiB 限制'), { code: -32602 });
+        }
+        if (mime.startsWith('image/')) {
+          images.push({ type: 'image', data: res.blob, mimeType: mime || 'image/png' });
+        } else {
+          const stateDir = process.env.CODA_PLUGIN_STATE || tmpdir();
+          const attachmentsRoot = join(stateDir, 'attachments');
+          const targetDir = join(attachmentsRoot, sessionId || 'global');
+          assertContained(targetDir, attachmentsRoot);
+          await fs.promises.mkdir(targetDir, { recursive: true });
+
+          const hash = createHash('sha256').update(buf).digest('hex').slice(0, 12);
+          const sanitized = getSanitizedBasename(res.uri, mime);
+          const safeFileName = `${attachmentIndex}-${hash}-${sanitized}`;
+          const filePath = join(targetDir, safeFileName);
+          assertContained(filePath, targetDir);
+
+          try {
+            await fs.promises.writeFile(filePath, buf);
+          } catch (e) {
+            throw Object.assign(new Error(`保存附件失败：${e.message}`), { code: -32603 });
+          }
+
+          attachmentIndex++;
+          const uriStr = res.uri ?? 'attachment';
+          const mimeStr = mime || 'application/octet-stream';
+          message += (message ? '\n' : '') + `--- Resource attachment: ${filePath} (mime: ${mimeStr}, uri: ${uriStr}) ---`;
+        }
+      }
+    }
+  }
+  return { message, images };
+}
+
+async function cleanupOldAttachments() {
+  try {
+    const stateDir = process.env.CODA_PLUGIN_STATE || tmpdir();
+    const attachmentsRoot = join(stateDir, 'attachments');
+    if (!existsSync(attachmentsRoot)) return;
+    const entries = await fs.promises.readdir(attachmentsRoot, { withFileTypes: true });
+    const now = Date.now();
+    const maxAgeMs = 7 * 24 * 60 * 60 * 1000;
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const sessionDirName = entry.name;
+        if (sessions.has(sessionDirName) || loadingSessions.has(sessionDirName)) continue;
+        try {
+          const dirPath = join(attachmentsRoot, sessionDirName);
+          const files = await fs.promises.readdir(dirPath, { withFileTypes: true });
+          let newestMtime = 0;
+          for (const file of files) {
+            try {
+              const fileStat = await fs.promises.stat(join(dirPath, file.name));
+              if (fileStat.mtimeMs > newestMtime) {
+                newestMtime = fileStat.mtimeMs;
+              }
+            } catch {}
+          }
+          if (newestMtime === 0) {
+            const dirStat = await fs.promises.stat(dirPath);
+            newestMtime = dirStat.mtimeMs;
+          }
+          if (now - newestMtime > maxAgeMs) {
+            await fs.promises.rm(dirPath, { recursive: true, force: true });
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+}
+cleanupOldAttachments().catch(() => {});
 
 function getSession(sessionId) {
   const session = sessions.get(sessionId);
@@ -730,27 +1177,38 @@ function handleCancel(params) {
   const session = sessions.get(params.sessionId);
   if (!session) return;
 
-  if (session.turn) {
-    session.turn.cancelled = true;
+  const turn = session.turn;
+  const pi = session.pi;
+  if (turn) {
+    turn.cancelled = true;
+    clearPendingExtUI(session);
+    if (turn.preparing) {
+      turn.settled = true;
+      turn.stopReason = 'cancelled';
+      if (session.turn === turn) session.turn = null;
+      turn.resolve?.({ stopReason: 'cancelled' });
+      return;
+    }
     // Send clear_queue then abort to pi
-    if (session.pi && !session.pi.exited) {
-      session.pi.send('clear_queue', {}, { timeout: 5000 }).catch(() => {});
-      session.pi.send('abort', {}, { timeout: 10000 })
+    if (pi && !pi.exited) {
+      pi.send('clear_queue', {}, { timeout: 5000 }).catch(() => {});
+      pi.send('abort', {}, { timeout: 10000 })
         .then(() => {
-          // Pi stopped; if turn still pending, finish it
-          if (session.turn) {
-            session.turn.settled = true;
-            session.turn.stopReason = 'cancelled';
-            finishTurn(session);
+          // Pi stopped; if turn still matches, finish it
+          if (session.turn === turn && session.pi === pi && !turn.settled) {
+            turn.settled = true;
+            turn.stopReason = 'cancelled';
+            finishTurn(session, turn);
           }
         })
         .catch(() => {
-          // Pi hung; cancel locally and respawn lazily on the next turn.
-          if (session.turn) {
-            session.pi.kill();
-            session.turn.settled = true;
-            session.turn.stopReason = 'cancelled';
-            finishTurn(session);
+          // Pi hung; kill and finish only when session.turn === turn && session.pi === pi.
+          // If the turn already settled via agent_settled, do nothing.
+          if (session.turn === turn && session.pi === pi && !turn.settled) {
+            pi.kill();
+            turn.settled = true;
+            turn.stopReason = 'cancelled';
+            finishTurn(session, turn);
           }
         });
     }
@@ -764,8 +1222,10 @@ function handleCodaResponse(message) {
     const pending = session._pendingExtUI?.get(message.id);
     if (!pending) continue;
     session._pendingExtUI.delete(message.id);
+    if (pending.timer) clearTimeout(pending.timer);
 
     if (message.error) {
+      log('extension_ui_response:', pending.piId, pending.type, 'cancelled');
       session.pi.write({ type: 'extension_ui_response', id: pending.piId, cancelled: true });
       return;
     }
@@ -773,25 +1233,50 @@ function handleCodaResponse(message) {
     const result = message.result;
     if (pending.type === 'confirm') {
       const outcome = result?.outcome;
-      if (outcome?.outcome === 'cancelled' || outcome?.outcome === 'selected') {
-        const allowed = outcome.outcome === 'selected' && outcome.optionId === 'allow';
-        session.pi.write({ type: 'extension_ui_response', id: pending.piId, confirmed: allowed });
+      if (outcome?.outcome === 'cancelled') {
+        const resp = { type: 'extension_ui_response', id: pending.piId, cancelled: true };
+        log('extension_ui_response:', pending.piId, pending.type, 'cancelled');
+        session.pi.write(resp);
+      } else if (outcome?.outcome === 'selected') {
+        if (outcome.optionId === 'allow') {
+          const resp = { type: 'extension_ui_response', id: pending.piId, confirmed: true };
+          log('extension_ui_response:', pending.piId, pending.type, 'accepted');
+          session.pi.write(resp);
+        } else if (outcome.optionId === 'reject') {
+          const resp = { type: 'extension_ui_response', id: pending.piId, confirmed: false };
+          log('extension_ui_response:', pending.piId, pending.type, 'accepted');
+          session.pi.write(resp);
+        } else {
+          const resp = { type: 'extension_ui_response', id: pending.piId, cancelled: true };
+          log('extension_ui_response:', pending.piId, pending.type, 'cancelled');
+          session.pi.write(resp);
+        }
       } else {
-        session.pi.write({ type: 'extension_ui_response', id: pending.piId, cancelled: true });
+        const resp = { type: 'extension_ui_response', id: pending.piId, cancelled: true };
+        log('extension_ui_response:', pending.piId, pending.type, 'cancelled');
+        session.pi.write(resp);
       }
       return;
     } else if (pending.type === 'select') {
-      if (result?.action === 'accept' && result?.data?.choice) {
-        session.pi.write({ type: 'extension_ui_response', id: pending.piId, value: result.data.choice });
+      if (result?.action === 'accept' && result?.content?.choice !== undefined) {
+        const resp = { type: 'extension_ui_response', id: pending.piId, value: result.content.choice };
+        log('extension_ui_response:', pending.piId, pending.type, 'accepted');
+        session.pi.write(resp);
       } else {
-        session.pi.write({ type: 'extension_ui_response', id: pending.piId, cancelled: true });
+        const resp = { type: 'extension_ui_response', id: pending.piId, cancelled: true };
+        log('extension_ui_response:', pending.piId, pending.type, 'cancelled');
+        session.pi.write(resp);
       }
       return;
     } else if (pending.type === 'input') {
-      if (result?.action === 'accept' && result?.data?.text !== undefined) {
-        session.pi.write({ type: 'extension_ui_response', id: pending.piId, value: result.data.text });
+      if (result?.action === 'accept' && result?.content?.text !== undefined) {
+        const resp = { type: 'extension_ui_response', id: pending.piId, value: result.content.text };
+        log('extension_ui_response:', pending.piId, pending.type, 'accepted');
+        session.pi.write(resp);
       } else {
-        session.pi.write({ type: 'extension_ui_response', id: pending.piId, cancelled: true });
+        const resp = { type: 'extension_ui_response', id: pending.piId, cancelled: true };
+        log('extension_ui_response:', pending.piId, pending.type, 'cancelled');
+        session.pi.write(resp);
       }
       return;
     }

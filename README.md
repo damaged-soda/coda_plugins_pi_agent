@@ -27,9 +27,11 @@
 - 工具执行、思考流、会话标题与可用命令映射为 `session/update`。
 - `_session/steering` 映射为 Pi `steer`；空闲时返回 `promptRequired`。
 - Pi 扩展的确认、选择和输入请求映射为 ACP 审批或表单。
+- 执行失败按 Coda 协议分类：上报额度耗尽（`quota_exhausted`）与临时服务故障（`service_unavailable`，`input: "accepted"`）；短时限流（rate limit）刻意保留为普通错误，不自动重试。
 
 ## 限制
 
 - 不报告 Pi 后台任务、子 Agent 与定时唤醒（`_coda/wait`）。
 - 不回放历史；Coda 保存自己的会话展示。
+- 对尚未发过提示词、尚无会话文件的 Pi 会话执行 `session/load` 时，会以该 ID 启动一个空会话，Pi 会输出警告日志。
 - 取消依赖 Pi 的 `clear_queue` / `abort`；约 10 秒未停止时会终止 Pi 子进程，后续轮次按需重新启动。
