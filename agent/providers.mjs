@@ -35,21 +35,32 @@ export async function listModels(row, key, fetcher = fetch) {
   }));
 }
 
+// Where a row's provider is: the model service another plugin provides that it chooses (`source`, Coda's
+// CODA_MODEL_PROVIDERS: its address, API and the file of its key), else its own address and key. Null when it has neither.
+export function endpointOf(name, row, env = process.env, typedKey) {
+  if (row?.source) {
+    const provided = parse(env.CODA_MODEL_PROVIDERS)[row.source];
+    if (!provided?.url) return null;
+    return { url: provided.url, api: provided.api || row.api, key: keyOf(provided.keyFile) };
+  }
+  if (!row?.url) return null;
+  return { url: row.url, api: row.api, key: typedKey ?? keyOf(parse(env.CODA_PLUGIN_SECRETS)['pi.providers']?.[name]?.key) };
+}
+
 export default async function codaProviders(pi) {
   const rows = parse(process.env.CODA_PLUGIN_SETTINGS)['pi.providers'] ?? {};
-  const keys = parse(process.env.CODA_PLUGIN_SECRETS)['pi.providers'] ?? {};
   const state = process.env.CODA_PLUGIN_STATE;
   const cacheFile = state ? join(state, 'provider-models.json') : null;
   const cache = cacheFile ? parse((() => { try { return readFileSync(cacheFile, 'utf8'); } catch { return '{}'; } })()) : {};
   const listed = await Promise.all(Object.entries(rows).map(async ([name, row]) => {
     // Pi names a model `<provider>/<model>`: a name with a slash cannot be told apart.
-    if (!row?.url || name.includes('/')) { log(`跳过 provider「${name}」：${name.includes('/') ? '名称不能带 /' : '没有地址'}`); return null; }
-    const key = keyOf(keys[name]?.key);
+    const at = name.includes('/') ? null : endpointOf(name, row);
+    if (!at) { log(`跳过 provider「${name}」：${name.includes('/') ? '名称不能带 /' : row?.source ? `来源 ${row.source} 在这台机器上没有` : '没有地址'}`); return null; }
     let models;
-    try { models = await listModels(row, key); cache[name] = models; }
+    try { models = await listModels({ ...row, url: at.url }, at.key); cache[name] = models; }
     catch (e) { models = cache[name] ?? []; log(`provider「${name}」列不出模型（${e.message}）${models.length ? '，用上次列出的' : ''}`); }
     if (!models.length) return null;
-    pi.registerProvider(name, { name, baseUrl: row.url, apiKey: key ?? 'none', api: row.api ?? 'openai-completions', models });
+    pi.registerProvider(name, { name, baseUrl: at.url, apiKey: at.key ?? 'none', api: at.api ?? 'openai-completions', models });
     return name;
   }));
   if (cacheFile && listed.some(Boolean)) {

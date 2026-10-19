@@ -53,6 +53,29 @@ test("checking a row lists what its address gives, with the key typed or the one
     [{ type: "markdown", text: "能连上，共 2 个模型" }, { type: "stat", label: "qwen", value: "32.8K 上下文" }, { type: "stat", label: "gemini", value: "1M 上下文" }]);
   await check({ row: "rig", value: { url: "https://rig/v1" }, secrets: {} }, env, fetcher);
   assert.deepEqual(seen, ["Bearer sk-typed", "Bearer sk-kept"]);
-  assert.match((await check({ row: "rig", value: {} }, env, fetcher)).items[0].text, /先填地址/);
+  assert.match((await check({ row: "rig", value: {} }, env, fetcher)).items[0].text, /先选来源或填地址/);
   assert.match((await check({ row: "rig", value: { url: "https://rig/v1" } }, {}, async () => ({ ok: false, status: 401 }))).items[0].text, /列不出模型：.*401/);
+});
+
+test("a row choosing a model service another plugin provides uses its address and key, not its own", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-source-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, "proxy-key"), "sk-proxy");
+  const saved = { ...process.env }, fetched = globalThis.fetch;
+  t.after(() => { process.env = saved; globalThis.fetch = fetched; });
+  process.env.CODA_PLUGIN_STATE = dir;
+  process.env.CODA_MODEL_PROVIDERS = JSON.stringify({ "cliproxy/cliproxy": { plugin: "cliproxy", title: "CLIProxy", api: "openai-completions", url: "https://proxy/v1", keyFile: join(dir, "proxy-key") } });
+  process.env.CODA_PLUGIN_SETTINGS = JSON.stringify({ "pi.providers": {
+    cli: { source: "cliproxy/cliproxy", url: null, key: null, api: "anthropic-messages", reasoning: true, contextWindow: 128000, maxTokens: 16384 },
+    gone: { source: "other/missing", url: null } } });
+  process.env.CODA_PLUGIN_SECRETS = "{}";
+  const seen = [], registered = [], pi = { registerProvider: (name, config) => registered.push([name, config]) };
+  globalThis.fetch = async (url, options) => { seen.push([url, options.headers.Authorization]); return answer({ data: [{ id: "gemini" }] })(); };
+  await codaProviders(pi);
+  assert.deepEqual(seen, [["https://proxy/v1/models", "Bearer sk-proxy"]]);
+  assert.deepEqual(registered.map(([name, config]) => [name, config.baseUrl, config.apiKey, config.api]), [["cli", "https://proxy/v1", "sk-proxy", "openai-completions"]]);
+  // Checked the same way, before or after it is saved.
+  const checked = await check({ row: "cli", value: { source: "cliproxy/cliproxy" }, secrets: {} }, process.env, async () => answer({ data: [{ id: "gemini" }] })());
+  assert.equal(checked.items[0].text, "能连上，共 1 个模型");
+  assert.match((await check({ row: "gone", value: { source: "other/missing" } }, process.env)).items[0].text, /这台机器上没有 other\/missing/);
 });

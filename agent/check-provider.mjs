@@ -2,21 +2,17 @@
 // Pi would when it starts, with the key typed and not saved yet, else the one Coda keeps for the row.
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { listModels } from './providers.mjs';
+import { endpointOf, listModels } from './providers.mjs';
 
 const tokens = n => n >= 1000000 ? `${+(n / 1000000).toFixed(1)}M` : n >= 1000 ? `${+(n / 1000).toFixed(1)}K` : String(n);
 
 export async function check(request, env = process.env, fetcher = fetch) {
   const row = request?.value ?? {}, name = String(request?.row ?? '');
-  if (!row.url) return { items: [{ type: 'error', text: '先填地址' }] };
   if (name.includes('/')) return { items: [{ type: 'error', text: '名称不能带 /：Pi 用「provider/模型」认模型' }] };
-  let key = request?.secrets?.key;
-  if (!key) {
-    const file = JSON.parse(env.CODA_PLUGIN_SECRETS || '{}')['pi.providers']?.[name]?.key;
-    try { key = file ? readFileSync(file, 'utf8').trim() : undefined; } catch { key = undefined; }
-  }
+  const at = endpointOf(name, row, env, request?.secrets?.key || undefined);
+  if (!at) return { items: [{ type: 'error', text: row.source ? `这台机器上没有 ${row.source}：先在提供它的插件里填好地址` : '先选来源或填地址' }] };
   let models;
-  try { models = await listModels(row, key, fetcher); }
+  try { models = await listModels({ ...row, url: at.url }, at.key, fetcher); }
   catch (e) { return { items: [{ type: 'error', text: `列不出模型：${e.message}` }] }; }
   if (!models.length) return { items: [{ type: 'error', text: '能连上，但没有列出模型' }] };
   return { items: [{ type: 'markdown', text: `能连上，共 ${models.length} 个模型` },
