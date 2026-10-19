@@ -239,6 +239,8 @@ async function ensurePiRunning(session) {
 // ---- Spawn pi for a session ----
 async function spawnPi(session, systemPromptFile, extraArgs = []) {
   const args = ['--mode', 'rpc', '--session-id', session.sessionId, ...extraArgs];
+  // The providers set in Coda (`pi.providers`), registered by an extension that lists their models as Pi starts.
+  if (Object.keys(settings['pi.providers'] ?? {}).length) args.push('--extension', join(pluginPath, 'agent', 'providers.mjs'));
   if (systemPromptFile) {
     args.push('--append-system-prompt', systemPromptFile);
   }

@@ -2,7 +2,7 @@
   "name": "pi",
   "displayName": "Pi",
   "description": "Pi Agent 插件：把本机安装的 Pi coding agent 以 RPC 模式接入 Coda，支持会话指令、模型与推理强度选择、插话和会话恢复。",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "contributes": {
     "agents": [
       {
@@ -25,12 +25,71 @@
         "pi.commandPath": {
           "type": "string",
           "default": "pi",
-          "description": "pi 可执行文件的路径；留为 pi 时使用 PATH 和常见安装目录。"
+          "description": "pi 可执行文件的路径；留为 pi 时使用 PATH 和常见安装目录。",
+          "order": 1
         },
         "pi.extraArgs": {
           "type": "string",
           "default": "",
-          "description": "追加到 pi --mode rpc 的额外参数，按空白分隔。"
+          "description": "追加到 pi --mode rpc 的额外参数，按空白分隔。",
+          "order": 2
+        },
+        "pi.providers": {
+          "type": "object",
+          "title": "Provider",
+          "order": 3,
+          "description": "一行一个 provider，行名是 Pi 里的 provider 名（不带 /）。模型从「地址/models」列出，Pi 每次启动时重新列；在 Coda 点「重新读取模型」即刷新。",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "url"
+            ],
+            "properties": {
+              "url": {
+                "type": "string",
+                "title": "地址",
+                "order": 1,
+                "description": "OpenAI 兼容的 API 地址，如 https://example.com/v1"
+              },
+              "key": {
+                "type": "string",
+                "writeOnly": true,
+                "title": "Key",
+                "order": 2
+              },
+              "api": {
+                "type": "string",
+                "title": "协议",
+                "order": 3,
+                "enum": [
+                  "openai-completions",
+                  "openai-responses",
+                  "anthropic-messages"
+                ],
+                "default": "openai-completions"
+              },
+              "reasoning": {
+                "type": "boolean",
+                "title": "推理",
+                "order": 4,
+                "default": true
+              },
+              "contextWindow": {
+                "type": "integer",
+                "title": "上下文长度",
+                "order": 5,
+                "minimum": 1,
+                "default": 128000
+              },
+              "maxTokens": {
+                "type": "integer",
+                "title": "最大输出",
+                "order": 6,
+                "minimum": 1,
+                "default": 16384
+              }
+            }
+          }
         }
       }
     }

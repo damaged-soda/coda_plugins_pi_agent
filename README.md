@@ -20,6 +20,17 @@
 | --- | --- | --- |
 | `pi.commandPath` | `pi` | `pi` 可执行文件路径；找不到时依次检查 PATH、`~/.npm-global/bin`、`/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/bin`、`~/.bun/bin`。 |
 | `pi.extraArgs` | 空 | 追加到 `pi --mode rpc` 的额外 CLI 参数。 |
+| `pi.providers` | 无 | 一行一个 provider：地址、Key（密文）、协议、推理、上下文长度、最大输出。行名就是 Pi 里的 provider 名（不能带 `/`）。 |
+
+## Provider
+
+在 Coda 的「设置 › 插件 › Pi › Provider」里加一行，填 OpenAI 兼容的地址（如 `https://example.com/v1`），需要时填 Key。不用手写模型：
+
+- 插件启动 Pi 时带上 `agent/providers.mjs` 扩展，它对每一行请求「地址/models」，把列出的模型注册成这个 provider 的模型；Key 从 Coda 的密文文件读（`CODA_PLUGIN_SECRETS`），不进 `models.json`。
+- 列表给了上下文长度（OpenRouter 的 `context_length`、vLLM 的 `max_model_len`、llama.cpp 的 `meta.n_ctx_train`）就用它，否则用这一行的「上下文长度」；推理与最大输出取这一行的。
+- 刷新：在 Coda 里点「重新读取模型」，Pi 重新启动、重新列。地址暂时连不上时用上次列出的（存在插件状态目录的 `provider-models.json`）。
+- 与 `~/.pi/agent/models.json` 里的 provider 同名时，以 Coda 这一行为准。
+- 需要支持密文与几列表格的 Coda（coda-console/coda#1387 第 1、4 步）。
 
 ## 协议映射
 
