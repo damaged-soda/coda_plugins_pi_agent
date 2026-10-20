@@ -2,7 +2,7 @@
   "name": "pi",
   "displayName": "Pi",
   "description": "Pi Agent 插件：把本机安装的 Pi coding agent 以 RPC 模式接入 Coda，支持会话指令、模型与推理强度选择、插话和会话恢复。",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "contributes": {
     "agents": [
       {
@@ -51,6 +51,9 @@
               },
               "url": {
                 "type": "string",
+                "format": "coda-model-url",
+                "modelKey": "key",
+                "modelApi": "api",
                 "title": "地址",
                 "order": 1,
                 "description": "OpenAI 兼容的 API 地址，如 https://example.com/v1"
@@ -97,13 +100,6 @@
         }
       }
     },
-    "endpoints": [
-      {
-        "id": "check-provider",
-        "command": "exec \"$CODA_NODE\" \"$CODA_PLUGIN_PATH/agent/check-provider.mjs\"",
-        "checks": "pi.providers"
-      }
-    ],
     "setup": {
       "command": "exec \"$CODA_NODE\" \"$CODA_PLUGIN_PATH/agent/setup.mjs\""
     }
