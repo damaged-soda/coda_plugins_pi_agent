@@ -2,7 +2,7 @@
   "name": "pi",
   "displayName": "Pi",
   "description": "Pi Agent 插件：把本机安装的 Pi coding agent 以 RPC 模式接入 Coda，支持会话指令、模型与推理强度选择、插话和会话恢复。",
-  "version": "0.5.0",
+  "version": "0.2.0",
   "contributes": {
     "agents": [
       {
