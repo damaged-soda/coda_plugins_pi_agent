@@ -12,7 +12,7 @@ export async function check(request, env = process.env, fetcher = fetch) {
   const at = endpointOf(name, row, env, request?.secrets?.key || undefined);
   if (!at) return { items: [{ type: 'error', text: row.source ? `这台机器上没有 ${row.source}：先在提供它的插件里填好地址` : '先选来源或填地址' }] };
   let models;
-  try { models = await listModels({ ...row, url: at.url }, at.key, fetcher); }
+  try { models = await listModels({ ...row, url: at.url, api: at.api }, at.key, fetcher); }
   catch (e) { return { items: [{ type: 'error', text: `列不出模型：${e.message}` }] }; }
   if (!models.length) return { items: [{ type: 'error', text: '能连上，但没有列出模型' }] };
   return { items: [{ type: 'markdown', text: `能连上，共 ${models.length} 个模型` },

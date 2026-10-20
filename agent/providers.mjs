@@ -16,10 +16,13 @@ function keyOf(file) {
 }
 
 // The models a provider's address lists, as Pi takes them: the row's defaults, a context window the list gives instead
-// (OpenRouter's `context_length`, vLLM's `max_model_len`, llama.cpp's `meta.n_ctx_train`).
+// (OpenRouter's `context_length`, vLLM's `max_model_len`, llama.cpp's `meta.n_ctx_train`). Asked as the API it is called
+// with (`row.api`) asks: a proxy that serves both (CLIProxy) lists other names to an Anthropic client, names its OpenAI
+// route does not know.
 export async function listModels(row, key, fetcher = fetch) {
   const url = `${String(row.url).replace(/\/+$/, '')}/models`;
-  const headers = key ? { Authorization: `Bearer ${key}`, 'x-api-key': key, 'anthropic-version': '2023-06-01' } : {};
+  const headers = !key ? {} : row.api === 'anthropic-messages' ? { 'x-api-key': key, 'anthropic-version': '2023-06-01' }
+    : { Authorization: `Bearer ${key}` };
   const response = await fetcher(url, { headers, signal: AbortSignal.timeout(LIST_TIMEOUT) });
   if (!response.ok) throw new Error(`${url} 回答 ${response.status}`);
   const body = await response.json();
@@ -57,7 +60,7 @@ export default async function codaProviders(pi) {
     const at = name.includes('/') ? null : endpointOf(name, row);
     if (!at) { log(`跳过 provider「${name}」：${name.includes('/') ? '名称不能带 /' : row?.source ? `来源 ${row.source} 在这台机器上没有` : '没有地址'}`); return null; }
     let models;
-    try { models = await listModels({ ...row, url: at.url }, at.key); cache[name] = models; }
+    try { models = await listModels({ ...row, url: at.url, api: at.api }, at.key); cache[name] = models; }
     catch (e) { models = cache[name] ?? []; log(`provider「${name}」列不出模型（${e.message}）${models.length ? '，用上次列出的' : ''}`); }
     if (!models.length) return null;
     pi.registerProvider(name, { name, baseUrl: at.url, apiKey: at.key ?? 'none', api: at.api ?? 'openai-completions', models });

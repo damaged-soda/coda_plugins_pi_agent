@@ -8,12 +8,15 @@ import { check } from "../agent/check-provider.mjs";
 
 const answer = body => async () => ({ ok: true, json: async () => body });
 
-test("listModels takes the OpenAI list, the row's defaults, and a context window the list gives", async () => {
+test("listModels takes the OpenAI list, the row's defaults, and a context window the list gives, asking as the row's API asks", async () => {
   const seen = [];
   const fetcher = async (url, options) => { seen.push([url, options.headers]); return answer({ data: [
     { id: "qwen", meta: { n_ctx_train: 32768 } }, { id: "gemini", display_name: "Gemini" }, { object: "model" }] })(); };
   const models = await listModels({ url: "https://rig/v1/", reasoning: false, maxTokens: 8192 }, "sk", fetcher);
-  assert.deepEqual(seen, [["https://rig/v1/models", { Authorization: "Bearer sk", "x-api-key": "sk", "anthropic-version": "2023-06-01" }]]);
+  assert.deepEqual(seen, [["https://rig/v1/models", { Authorization: "Bearer sk" }]]);
+  // An Anthropic client is asked as one: a proxy serving both lists other names to it.
+  await listModels({ url: "https://rig/v1", api: "anthropic-messages" }, "sk", fetcher);
+  assert.deepEqual(seen[1], ["https://rig/v1/models", { "x-api-key": "sk", "anthropic-version": "2023-06-01" }]);
   assert.deepEqual(models.map(m => [m.id, m.name, m.reasoning, m.contextWindow, m.maxTokens]),
     [["qwen", "qwen", false, 32768, 8192], ["gemini", "Gemini", false, 128000, 8192]]);
   await assert.rejects(listModels({ url: "https://rig/v1" }, undefined, async () => ({ ok: false, status: 401 })), /401/);
@@ -70,9 +73,10 @@ test("a row choosing a model service another plugin provides uses its address an
     gone: { source: "other/missing", url: null } } });
   process.env.CODA_PLUGIN_SECRETS = "{}";
   const seen = [], registered = [], pi = { registerProvider: (name, config) => registered.push([name, config]) };
-  globalThis.fetch = async (url, options) => { seen.push([url, options.headers.Authorization]); return answer({ data: [{ id: "gemini" }] })(); };
+  globalThis.fetch = async (url, options) => { seen.push([url, options.headers]); return answer({ data: [{ id: "gemini" }] })(); };
   await codaProviders(pi);
-  assert.deepEqual(seen, [["https://proxy/v1/models", "Bearer sk-proxy"]]);
+  // Asked as the service's API asks, not the row's own.
+  assert.deepEqual(seen, [["https://proxy/v1/models", { Authorization: "Bearer sk-proxy" }]]);
   assert.deepEqual(registered.map(([name, config]) => [name, config.baseUrl, config.apiKey, config.api]), [["cli", "https://proxy/v1", "sk-proxy", "openai-completions"]]);
   // Checked the same way, before or after it is saved.
   const checked = await check({ row: "cli", value: { source: "cliproxy/cliproxy" }, secrets: {} }, process.env, async () => answer({ data: [{ id: "gemini" }] })());
