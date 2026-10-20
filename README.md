@@ -1,11 +1,14 @@
 # Pi Agent
 
-把本机安装的 Pi coding agent（`@earendil-works/pi-coding-agent`）接入 Coda。每个 Coda 会话启动一个 `pi --mode rpc` 子进程，由插件在 Coda 的 ACP JSON-RPC 和 Pi 的 JSONL RPC 之间转换。
+把 Pi coding agent（`@earendil-works/pi-coding-agent`）接入 Coda。每个 Coda 会话启动一个 `pi --mode rpc` 子进程，由插件在 Coda 的 ACP JSON-RPC 和 Pi 的 JSONL RPC 之间转换。
 
 ## 要求
 
-- 已安装 `pi`，并已配置可用的 provider 或完成登录。
-- Node 由 Coda 提供（`$CODA_NODE`），无需本插件安装任何 npm 依赖。
+- Pi 由插件自动准备：安装或更新插件后，Coda 运行插件的「准备运行环境」（`agent/setup.mjs`）。这台机器已有 `pi`（设置里的路径、PATH 或下面的常见目录）就直接用；
+  没有就用 Coda 自带的 Node 和 npm 把最新的 `@earendil-works/pi-coding-agent` 装进插件自己的状态目录（`$CODA_PLUGIN_STATE/pi`），不动全局。
+  装不上时插件页会写原因并给「重试」；也可以自己 `npm i -g @earendil-works/pi-coding-agent`。
+- 还要在 Coda 里添加 provider（见下），或在 pi 里完成登录。
+- Node 由 Coda 提供（`$CODA_NODE`），插件本身不需要 npm 依赖。
 - 直接使用本机 Pi 的配置、登录、扩展与会话目录（`$PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`），插件不复制也不改写它们；Coda 里开的会话也能在 `pi --resume` 里看到。
 
 ## 安装
@@ -18,7 +21,7 @@
 
 | 设置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `pi.commandPath` | `pi` | `pi` 可执行文件路径；找不到时依次检查 PATH、`~/.npm-global/bin`、`/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/bin`、`~/.bun/bin`。 |
+| `pi.commandPath` | `pi` | `pi` 可执行文件路径；留为 `pi` 时依次检查 PATH、`~/.npm-global/bin`、`/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/bin`、`~/.bun/bin`，最后是插件自己装的那份。填了路径却运行不了时，准备运行环境会报错，不另装一份。 |
 | `pi.extraArgs` | 空 | 追加到 `pi --mode rpc` 的额外 CLI 参数。 |
 | `pi.providers` | 无 | 一行一个 provider：地址、Key（密文）、协议、推理、上下文长度、最大输出。行名就是 Pi 里的 provider 名（不能带 `/`）。 |
 

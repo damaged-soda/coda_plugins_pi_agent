@@ -1,6 +1,6 @@
 // Coda's 「检查」 for a row of `pi.providers` (Coda docs/plugins.md「设置的检查」): lists the models its address gives, as
 // Pi would when it starts, with the key typed and not saved yet, else the one Coda keeps for the row.
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { endpointOf, listModels } from './providers.mjs';
 
@@ -20,7 +20,8 @@ export async function check(request, env = process.env, fetcher = fetch) {
     ...(models.length > 40 ? [{ type: 'markdown', text: `另有 ${models.length - 40} 个没有列出` }] : [])] };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Run as a command (Node names the module by its real path, so the path it was given is resolved the same way).
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   const request = JSON.parse(readFileSync(0, 'utf8') || '{}');
   process.stdout.write(JSON.stringify(await check(request)));
 }
